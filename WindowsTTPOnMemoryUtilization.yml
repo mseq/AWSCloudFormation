@@ -1,0 +1,223 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Create an Amazon EC2 Auto Scaling group that scales based on custom memory usage metric across Windows fleet
+  **WARNING** This template creates Amazon EC2 Auto Scaling group, Amazon EC2 Auto Scaling launch template, System Manager parameter, IAM role and EC2 instances and related resources. You will be billed for the AWS resources used if you create a stack from this template.
+#parameters needed for the template
+Parameters:
+  WinClientAmiID:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-WinCientAMI-Id
+  InstanceType:
+    Default: CFN-NLB-InstanceType
+    Type: AWS::SSM::Parameter::Value<String>
+  SapVPC:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-SapVPC
+  NLBSubnet:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-PublicSubnet
+  FleetSubnet:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-PrivateSubnet
+  SecurityGroup:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-FleetSecurityGroup
+  MaxSize:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-ASGMaxSize
+  MinSize:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-ASGMinSize
+  DesiredSize:
+    Default: CFN-NLB-ASGDesiredSize
+    Type: AWS::SSM::Parameter::Value<String>
+  WarmUpTime:
+    Default: CFN-NLB-ASGWarmUpTime
+    Type: AWS::SSM::Parameter::Value<String>
+  HealthCheckGracePeriod:
+    Default: CFN-NLB-ASGHealthCheckGracePeriod
+    Type: AWS::SSM::Parameter::Value<String>
+  MemoryPolicyTargetValue:
+    Default: CFN-NLB-ASGMemTargetPercentage
+    Type: AWS::SSM::Parameter::Value<String>
+  NLBElasticIP:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: CFN-NLB-ElasticIP
+#template created resources
+Resources:
+#create IAM role using CloudWatch Agent Server Policy
+  CloudWatchAgentServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CloudWatchAgentServerRole-WinClientELB'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonVPCReadOnlyAccess'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ReadOnlyAccess'
+        - !Sub 'arn:aws:iam::237755105977:policy/CustomPolicy-SSM-ReadParameters'
+        - !Sub 'arn:aws:iam::237755105977:policy/CustomPolicy-AutoScaling-SetDesiredCapacity'
+        - !Sub 'arn:aws:iam::237755105977:policy/CustomPolicy-AutoScaling-ManageInstanceProtection'
+#Create instance profile
+  FleetInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'CloudWatchAgentServerRole-WinClientELB'
+      Path: /
+      Roles:
+        - !Ref 'CloudWatchAgentServerRole'
+#Create launch template
+  FleetLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'AS-CW-Windows-WinClientELB'
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt 'FleetInstanceProfile.Arn'
+        ImageId: !Ref 'WinClientAmiID'
+        InstanceType: !Ref 'InstanceType'
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+            Groups: 
+              - !Ref 'SecurityGroup'
+#Create NLB Security Group
+  # NLBSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     Name: SG-NetworkLoadBalancer
+  #     GroupDescription: Allow the incoming RDP calls to arrive and pass through NLB
+  #     VpcId:
+  #       Ref: !Ref 'SapVPC'
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         FromPort: 3389
+  #         ToPort: 3389
+  #         CidrIp: 0.0.0.0/0
+#Create EIP for the NLB
+  # NLBElasticIP:
+  #   Type: AWS::EC2::EIP
+  #   Properties:
+  #     Domain: vpc
+  #     Tags:
+  #       - Key: Name
+  #         Value: EIP-WinClientELB 
+#Create NLB
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      # Scheme: internal
+      Type: network
+      Name: WinClient-NLB
+      # Subnets:
+      #   - !Ref 'NLBSubnet'
+      SubnetMappings:
+        # - AllocationId: !GetAtt 'NLBElasticIP.AllocationId'
+        - AllocationId: !Ref 'NLBElasticIP'
+          SubnetId: !Ref 'NLBSubnet'
+#Create NLB Target Group
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: instance
+      Name: TG-WinClientELB
+      Protocol: TCP_UDP
+      Port: 3389
+      # HealthCheckProtocol: TCP
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 8088
+      HealthCheckPath: /healthcheck
+      VpcId: !Ref 'SapVPC'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: source_ip
+  NLBTargetGroupB1IF:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: instance
+      Name: TG-WinClientB1IF
+      Protocol: TCP_UDP
+      Port: 8443
+      # HealthCheckProtocol: TCP
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 8088
+      HealthCheckPath: /healthcheck
+      VpcId: !Ref 'SapVPC'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: source_ip
+#Create NLB Listener
+  NLBListenerRDP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref 'NLB'
+      Port: 3389
+      Protocol: TCP_UDP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref 'NLBTargetGroup'
+  NLBListenerB1if:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref 'NLB'
+      Port: 8443
+      Protocol: TCP_UDP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref 'NLBTargetGroupB1IF'
+#Create ASG using previous created launch template
+  FleetASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      # AutoScalingGroupName: WinClientELB-FleetASG
+      MinSize: !Ref 'MinSize'
+      MaxSize: !Ref 'MaxSize'
+      DesiredCapacity: !Ref 'DesiredSize'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: !Ref 'HealthCheckGracePeriod'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref 'FleetLaunchTemplate'
+        Version: !GetAtt 'FleetLaunchTemplate.DefaultVersionNumber'
+      VPCZoneIdentifier: 
+        - !Ref 'FleetSubnet'
+      TargetGroupARNs: 
+        - !Ref 'NLBTargetGroup'
+        - !Ref 'NLBTargetGroupB1IF'
+# Create target tracking policy on custom memory
+  MemoryPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref 'FleetASG'
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: !Ref 'WarmUpTime'
+      TargetTrackingConfiguration:
+        CustomizedMetricSpecification:
+          Dimensions:
+            - Name: AutoScalingGroupName
+              Value: !Ref 'FleetASG'
+          MetricName: MemoryUtilization
+          Namespace: CWAgent
+          Statistic: Average
+        TargetValue: !Ref 'MemoryPolicyTargetValue'
+        DisableScaleIn: false
